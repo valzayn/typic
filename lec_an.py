@@ -16,35 +16,36 @@ patterns = {
     'DELIMITER': r"([{}[\]();,])",
 }
 
-tokens = []
-pos = 0
-code_len = len(code)
+def tokenize(code: str):
+    tokens = []
+    pos = 0
+    code_len = len(code)
 
-while pos < code_len:
-    if code[pos].isspace():
-        pos += 1
-        continue
+    while pos < code_len:
+        if code[pos].isspace():
+            pos += 1
+            continue
 
-    match = None
-    for token_type, pattern in patterns.items():
-        regex = re.compile(pattern)
-        match = regex.match(code, pos)
+        match = None
+        for token_type, pattern in patterns.items():
+            regex = re.compile(pattern)
+            match = regex.match(code, pos)
 
-        if match:
-            token_value = match.group(0)
-            if token_type != "COMMENT":
-                tokens.append((token_type, token_value))
-            pos = match.end()
-            break
+            if match:
+                token_value = match.group(0)
+                if token_type != "COMMENT":
+                    tokens.append((token_type, token_value))
+                pos = match.end()
+                break
 
-    if not match:
-        context_start = max(0, pos - 20)
-        context_end = min(code_len, pos + 20)
-        context = code[context_start:context_end]
-        raise SyntaxError(f"Illegal character: '{code[pos]}' at position {pos}\nContext: ...{context}...")
+        if not match:
+            context_start = max(0, pos - 20)
+            context_end = min(code_len, pos + 20)
+            context = code[context_start:context_end]
+            raise SyntaxError(f"Illegal character: '{code[pos]}' at position {pos}\nContext: ...{context}...")
 
-tokens.append(("EOF", "EOF"))
-
+    tokens.append(("EOF", "EOF"))
+    return tokens
 
 # УЗЕЛ ДЕРЕВА
 class Node:
