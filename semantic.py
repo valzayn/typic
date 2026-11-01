@@ -17,13 +17,16 @@ COMPATIBLE = {
 
 
 class Symbol:
-    def __init__(self, name, type_, kind="var", params=None, return_type=None, scope="global"):
+    def __init__(self, name, type_, kind="var", params=None, return_type=None, scope="global",
+                 container=None, dimensions=None):
         self.name = name
         self.type = type_
         self.kind = kind
         self.params = params or []
         self.return_type = return_type
         self.scope = scope
+        self.container = container
+        self.dimensions = list(dimensions) if dimensions is not None else []
 
 
 class SymbolTable:
@@ -128,8 +131,23 @@ class SemanticAnalyzer:
     def visit_Declaration(self, node):
         var_type = node.value
         for child in node.children:
+            if child.type not in ("VarName", "ArrayName", "VectorName"):
+                continue
+            element_type = var_type
+            container = None
+            dimensions = []
+            if child.type == "ArrayName":
+                container = "array"
+                dimensions = [dim.value for dim in child.children if dim.type == "Dimension"]
+            elif child.type == "VectorName":
+                container = "vector"
+                element_type = var_type[len("vector<"):-1]
+            symbol = Symbol(child.value, element_type, scope=self.table.current_scope(),
+                            container=container, dimensions=dimensions)
+            self.table.declare(symbol)
+            # Локальная область будет удалена из таблицы, но символ останется в дереве.
+            child.symbol = symbol
             if child.type == "VarName":
-                self.table.declare(Symbol(child.value, var_type))
                 for sub in child.children:
                     if sub.type == "Value":
                         expr_type = self.eval_expr(sub.value)
