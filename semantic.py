@@ -19,7 +19,7 @@ COMPATIBLE = {
 
 class Symbol:
     def __init__(self, name, type_, kind="var", params=None, return_type=None, scope="global",
-                 container=None, dimensions=None, known_dimensions=None):
+                 container=None, dimensions=None, known_dimensions=None, is_const=False):
         self.name = name
         self.type = type_
         self.kind = kind
@@ -29,6 +29,7 @@ class Symbol:
         self.container = container
         self.dimensions = list(dimensions) if dimensions is not None else []
         self.known_dimensions = list(known_dimensions) if known_dimensions is not None else []
+        self.is_const = is_const
 
 
 class SymbolTable:
@@ -132,9 +133,12 @@ class SemanticAnalyzer:
 
     def visit_Declaration(self, node):
         var_type = node.value
+        is_const = any(child.type == "Qualifier" and child.value == "const" for child in node.children)
         for child in node.children:
             if child.type not in ("VarName", "ArrayName", "VectorName"):
                 continue
+            if is_const and not any(sub.type in ("Value", "InitializerList") for sub in child.children):
+                raise SemanticError(f"Константа '{child.value}' должна иметь инициализацию")
             element_type = var_type
             container = None
             dimensions = []
@@ -147,7 +151,8 @@ class SemanticAnalyzer:
                 container = "vector"
                 element_type = var_type[len("vector<"):-1]
             symbol = Symbol(child.value, element_type, scope=self.table.current_scope(),
-                            container=container, dimensions=dimensions, known_dimensions=known_dimensions)
+                            container=container, dimensions=dimensions, known_dimensions=known_dimensions,
+                            is_const=is_const)
             self.table.declare(symbol)
             # Локальная область будет удалена из таблицы, но символ останется в дереве.
             child.symbol = symbol
@@ -167,6 +172,7 @@ class SemanticAnalyzer:
             if len(initializer.children) not in (1, 2):
                 raise SemanticError(f"Конструктор вектора '{symbol.name}' ожидает один или два аргумента")
             for index, argument in enumerate(initializer.children):
+                self._check_const_writes(argument.value)
                 try:
                     parsed, source = self._parse_container_expression(argument.value)
                     type_, value = self._container_expression_info(parsed, source)
@@ -218,6 +224,7 @@ class SemanticAnalyzer:
             else:
                 if child.type != "Value":
                     raise SemanticError(f"Лишняя вложенность списка инициализации '{name}'")
+                self._check_const_writes(child.value)
                 try:
                     parsed, source = self._parse_container_expression(child.value)
                     actual_type, _ = self._container_expression_info(parsed, source)
@@ -236,6 +243,7 @@ class SemanticAnalyzer:
                     raise SemanticError(f"У массива '{node.value}' можно пропустить только первый размер при наличии инициализации")
                 known_dimensions.append(None)
                 continue
+            self._check_const_writes(expression)
             try:
                 parsed, source = self._parse_container_expression(expression)
             except (SyntaxError, ValueError) as error:
@@ -363,6 +371,22 @@ class SemanticAnalyzer:
         if not node.value:
             return
         text = node.value.strip()
+        if text.startswith("const "):
+            declaration = re.fullmatch(r"const\s+(int|float|double|char|bool|void|auto)\s+(.+)", text)
+            if declaration is None:
+                raise SemanticError("Неподдерживаемое const-объявление в инициализации for")
+            var_type, variables = declaration.groups()
+            for variable in self.split_args(variables):
+                match = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*(?:=\s*(.+))?", variable)
+                if match is None:
+                    raise SemanticError("В инициализации for поддерживаются простые const-переменные")
+                var_name, rhs = match.groups()
+                if rhs is None:
+                    raise SemanticError(f"Константа '{var_name}' должна иметь инициализацию")
+                self.table.declare(Symbol(var_name, var_type, is_const=True))
+                rhs_type = self.eval_expr(rhs)
+                self.check_assign(var_type, rhs_type, var_name)
+            return
         m = re.match(
             r"^(int|float|double|char|bool|void|auto)\s+([A-Za-z_]\w*)\s*=\s*(.+)$",
             text,
@@ -430,6 +454,7 @@ class SemanticAnalyzer:
             self.eval_expr(node.value)
 
     visit_Iter = visit_ExprStmt
+    visit_Expression = visit_ExprStmt
 
     def visit_Empty(self, node):
         pass
@@ -441,6 +466,70 @@ class SemanticAnalyzer:
         pass
 
     # ---------- проверки ----------
+    def check_writable(self, name):
+        symbol = self.table.lookup(name)
+        if symbol is not None and symbol.is_const:
+            raise SemanticError(f"Нельзя изменять константу '{name}' или её элементы")
+
+    def _check_const_writes(self, text):
+        # Ищем цели записи во всём выражении, включая аргументы и индексы.
+        tokens = re.findall(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z_]\w*|\+\+|--|\+=|-=|\*=|/=|==|!=|<=|>=|&&|\|\||::|<<|>>|\S''', text)
+        pairs, stack, levels = {}, [], []
+        for position, token in enumerate(tokens):
+            levels.append(len(stack))
+            if token in ("(", "[", "{"):
+                stack.append(position)
+            elif token in (")", "]", "}") and stack:
+                opening = stack.pop()
+                pairs[opening] = position
+                pairs[position] = opening
+
+        def check_target(start):
+            while start < len(tokens) and tokens[start] == "(":
+                start += 1
+            if start < len(tokens) and re.fullmatch(r"[A-Za-z_]\w*", tokens[start]):
+                self.check_writable(tokens[start])
+
+        def previous_operand(end):
+            start = end
+            while start in pairs and tokens[start] in (")", "]"):
+                start = pairs[start]
+                if start > 0 and (tokens[start - 1] in (")", "]") or
+                                  re.fullmatch(r"[A-Za-z_]\w*", tokens[start - 1])):
+                    start -= 1
+                else:
+                    break
+            return start
+
+        input_levels = set()
+        for position, token in enumerate(tokens):
+            level = levels[position]
+            if token in ("=", "+=", "-=", "*=", "/=") and position > 0:
+                check_target(previous_operand(position - 1))
+            elif token in ("++", "--"):
+                if position > 0 and (tokens[position - 1] in (")", "]") or
+                                     re.fullmatch(r"[A-Za-z_]\w*", tokens[position - 1])):
+                    check_target(previous_operand(position - 1))
+                else:
+                    check_target(position + 1)
+
+            if token == "cin":
+                qualified = position >= 2 and tokens[position - 2:position] == ["std", "::"]
+                unqualified = (position == 0 or tokens[position - 1] != "::")
+                if qualified or (unqualified and self.table.lookup("cin") is self.table.scopes[0]["cin"]):
+                    input_levels.add(level)
+            elif token == ">>" and level in input_levels:
+                check_target(position + 1)
+            elif token == ")" and level in input_levels:
+                input_levels.discard(level)
+                opening = pairs[position]
+                if opening == 0 or not (tokens[opening - 1] in (")", "]") or
+                                        re.fullmatch(r"[A-Za-z_]\w*", tokens[opening - 1])):
+                    input_levels.add(level - 1)
+            elif token in ("=", "+=", "-=", "*=", "/=", ",", "&&", "||", "<<",
+                           "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", ")", "]", "}"):
+                input_levels.discard(level)
+
     def check_condition(self, expr):
         t = self.eval_expr(expr)
         if t not in ("bool", "int", "unknown"):
@@ -494,6 +583,7 @@ class SemanticAnalyzer:
         if not expr_text:
             return "unknown"
         text = expr_text.strip()
+        self._check_const_writes(text)
         accesses = self._check_element_accesses(text)
 
         # cout / cin — не проверяем как обычное выражение
@@ -608,7 +698,8 @@ class SemanticAnalyzer:
     @staticmethod
     def _find_assign(text):
         depth = 0
-        for i, ch in enumerate(text):
+        for token in re.finditer(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[\s\S]''', text):
+            i, ch = token.start(), token[0]
             if ch in "([{":
                 depth += 1
             elif ch in ")]}":
@@ -624,7 +715,7 @@ class SemanticAnalyzer:
     @staticmethod
     def split_args(s):
         args, depth, cur = [], 0, ""
-        for ch in s:
+        for ch in re.findall(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[\s\S]''', s):
             if ch == "," and depth == 0:
                 args.append(cur)
                 cur = ""
