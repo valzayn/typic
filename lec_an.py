@@ -78,7 +78,7 @@ class Node:
 
 # РАЗБОР ТОКЕНОВ И ПОСТРОЕНИЕ ДЕРЕВА
 class Parser:
-    # Уровни грамматики бинарных операций: от низкого приоритета к высокому.
+    # Допустимые бинарные операторы.
     BINARY_LEVELS = (
         ("||",),
         ("&&",),
@@ -217,6 +217,8 @@ class Parser:
             return self.try_catch()
         elif value in ("int", "float", "double", "char", "bool", "void", "auto", "const"):
             return self.declaration()
+        elif self._is_vector_declaration():
+            return self.vector_declaration()
         elif value in ("class", "struct"):
             return self.class_def()
         elif value == "using":
@@ -403,6 +405,48 @@ class Parser:
 
         return node
 
+    def _is_vector_declaration(self):
+        values = [value for _, value in self.tokens[self.pos:self.pos + 4]]
+        return values[:2] == ["vector", "<"] or values == ["std", "::", "vector", "<"]
+
+    def vector_declaration(self):
+        if self.current()[1] == "std":
+            self.match(value_="std")
+            self.match(value_="::")
+        self.match(value_="vector")
+        self.match(value_="<")
+        element_type = self.current()[1]
+        if element_type not in ("int", "float", "double", "char", "bool"):
+            raise SyntaxError(f"Unsupported vector element type '{element_type}' at token {self.pos}")
+        self.next()
+        self.match(value_=">")
+        node = Node("Declaration", f"vector<{element_type}>")
+
+        while True:
+            _, name = self.match(type_="IDENTIFIER")
+            variable = Node("VectorName", name)
+            if self.current()[1] == "=":
+                self.next()
+                variable.add(self.initializer_list())
+            elif self.current()[1] == "{":
+                variable.add(self.initializer_list())
+            elif self.current()[1] == "(":
+                self.next()
+                arguments = Node("ConstructorArgs")
+                arguments.add(Node("Value", self.expression()))
+                while self.current()[1] == ",":
+                    self.next()
+                    arguments.add(Node("Value", self.expression()))
+                self.match(value_=")")
+                variable.add(arguments)
+            node.add(variable)
+            if self.current()[1] != ",":
+                break
+            self.next()
+
+        self.match(value_=";")
+        return node
+
     def array_declaration(self, name):
         node = Node("ArrayName", name)
         while self.current()[1] == "[":
@@ -523,14 +567,11 @@ class Parser:
             # Присваивание группируется справа: a = (b = 1).
             self._assignment_expression()
 
-    def _binary_expression(self, level=0):
-        if level == len(self.BINARY_LEVELS):
-            self._unary_expression()
-            return
-        self._binary_expression(level + 1)
-        while self.current()[1] in self.BINARY_LEVELS[level]:
+    def _binary_expression(self):
+        self._unary_expression()
+        while any(self.current()[1] in operators for operators in self.BINARY_LEVELS):
             self.next()
-            self._binary_expression(level + 1)
+            self._unary_expression()
 
     def _unary_expression(self):
         if self.current()[1] in ("+", "-", "!", "++", "--"):
