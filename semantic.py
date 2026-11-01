@@ -1,3 +1,4 @@
+import ast
 import re
 
 
@@ -139,6 +140,7 @@ class SemanticAnalyzer:
             if child.type == "ArrayName":
                 container = "array"
                 dimensions = [dim.value for dim in child.children if dim.type == "Dimension"]
+                self.check_array_dimensions(child, dimensions)
             elif child.type == "VectorName":
                 container = "vector"
                 element_type = var_type[len("vector<"):-1]
@@ -152,6 +154,124 @@ class SemanticAnalyzer:
                     if sub.type == "Value":
                         expr_type = self.eval_expr(sub.value)
                         self.check_assign(var_type, expr_type, child.value)
+
+    def check_array_dimensions(self, node, dimensions):
+        if len(dimensions) not in (1, 2):
+            raise SemanticError(f"Массив '{node.value}' должен иметь одно или два измерения")
+        has_initializer = any(child.type in ("InitializerList", "Value") for child in node.children)
+        for index, expression in enumerate(dimensions):
+            if expression is None:
+                if index != 0 or not has_initializer:
+                    raise SemanticError(f"У массива '{node.value}' можно пропустить только первый размер при наличии инициализации")
+                continue
+            # Python AST используется только для арифметики; имена C++ вроде
+            # True или lambda временно получают префикс, строки не изменяются.
+            # Целые литералы с ведущим нулём читаются по правилам C++ (основание 8).
+            try:
+                source = re.sub(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b0[0-9]+\b(?!\.)|\b[A-Za-z_]\w*\b''',
+                                lambda match: (match[0] if match[0][0] in "\"'" else
+                                               str(int(match[0], 8)) if match[0][0].isdigit() else
+                                               "_size_" + match[0]), expression)
+                parsed = ast.parse(source, mode="eval").body
+            except (SyntaxError, ValueError) as error:
+                raise SemanticError(f"Неподдерживаемое выражение размера массива '{node.value}': {expression}") from error
+            type_, value = self._array_size_expression(parsed, source)
+            if type_ != "int":
+                raise SemanticError(f"Размер массива '{node.value}' должен иметь тип int, получен {type_}")
+            if value is not None and value <= 0:
+                raise SemanticError(f"Размер массива '{node.value}' должен быть положительным, получен {value}")
+
+    def _array_size_expression(self, node, source):
+        """Возвращает тип и известное целое значение; None означает размер времени выполнения."""
+        if isinstance(node, ast.Constant):
+            if type(node.value) is int:
+                return "int", node.value
+            if type(node.value) is float:
+                return "float", None
+            if isinstance(node.value, str):
+                literal = ast.get_source_segment(source, node) or ""
+                if literal.startswith("'") and len(node.value) == 1:
+                    return "char", ord(node.value)
+                return "string", None
+        elif isinstance(node, ast.Name):
+            name = node.id[len("_size_"):]
+            if name in ("true", "false"):
+                return "bool", int(name == "true")
+            symbol = self.table.lookup(name)
+            if symbol is None:
+                raise SemanticError(f"Необъявленное имя в размере массива: '{name}'")
+            if symbol.container or symbol.kind == "func":
+                raise SemanticError(f"В размере массива нужен элемент контейнера или вызов функции, а не '{name}' целиком")
+            return symbol.type, None
+        elif isinstance(node, ast.Subscript):
+            base, indices = node, []
+            while isinstance(base, ast.Subscript):
+                indices.append(base.slice)
+                base = base.value
+            symbol = self.table.lookup(base.id[len("_size_"):]) if isinstance(base, ast.Name) else None
+            if symbol is None or not symbol.container:
+                raise SemanticError("В размере массива индексируется необъявленный контейнер или обычная переменная")
+            rank = len(symbol.dimensions) if symbol.container == "array" else 1
+            if len(indices) != rank:
+                raise SemanticError("В размере массива нужно указать отдельный элемент контейнера")
+            for index in indices:
+                self._array_size_expression(index, source)
+            return symbol.type, None
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            name = node.func.id[len("_size_"):]
+            symbol = self.table.lookup(name)
+            if symbol is None or symbol.kind != "func":
+                raise SemanticError(f"Необъявленная функция в размере массива: '{name}'")
+            if node.keywords or len(node.args) != len(symbol.params):
+                raise SemanticError(f"Неверное число аргументов функции '{name}' в размере массива")
+            for argument in node.args:
+                self._array_size_expression(argument, source)
+            return symbol.return_type, None
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            type_, value = self._array_size_expression(node.operand, source)
+            if type_ not in NUMERIC:
+                raise SemanticError("Унарная операция в размере массива требует числовой операнд")
+            return ("int" if type_ in ("char", "bool") else type_,
+                    -value if value is not None and isinstance(node.op, ast.USub) else value)
+        elif isinstance(node, ast.BinOp):
+            left_type, left = self._array_size_expression(node.left, source)
+            right_type, right = self._array_size_expression(node.right, source)
+            if left_type not in NUMERIC or right_type not in NUMERIC:
+                raise SemanticError("Арифметика в размере массива требует числовые операнды")
+            integer = ("int", "char", "bool")
+            if isinstance(node.op, (ast.Mod, ast.LShift, ast.RShift)) and (left_type not in integer or right_type not in integer):
+                raise SemanticError("Остаток и сдвиги в размере массива требуют целочисленные операнды")
+            result_type = "double" if "double" in (left_type, right_type) else "float" if "float" in (left_type, right_type) else "int"
+            value = self._array_size_operation(node.op, left, right)
+            return result_type, value
+        elif isinstance(node, ast.Compare):
+            for operand in (node.left, *node.comparators):
+                self._array_size_expression(operand, source)
+            return "bool", None
+        raise SemanticError("Неподдерживаемая операция в выражении размера массива")
+
+    @staticmethod
+    def _array_size_operation(operation, left, right):
+        if isinstance(operation, (ast.Div, ast.Mod)) and right == 0:
+            raise SemanticError("Деление на ноль в выражении размера массива")
+        if isinstance(operation, (ast.LShift, ast.RShift)) and right is not None and right < 0:
+            raise SemanticError("Отрицательный сдвиг в выражении размера массива")
+        if left is None or right is None:
+            return None
+        if isinstance(operation, ast.Add):
+            return left + right
+        if isinstance(operation, ast.Sub):
+            return left - right
+        if isinstance(operation, ast.Mult):
+            return left * right
+        if isinstance(operation, (ast.Div, ast.Mod)):
+            quotient = abs(left) // abs(right) * (-1 if (left < 0) != (right < 0) else 1)
+            return quotient if isinstance(operation, ast.Div) else left - quotient * right
+        if isinstance(operation, ast.LShift):
+            return left << right
+        if isinstance(operation, ast.RShift):
+            return left >> right
+        raise SemanticError("Неподдерживаемая арифметическая операция в размере массива")
 
     # ---------- for: инициализация ----------
     def visit_Init(self, node):
