@@ -3,7 +3,9 @@ import re
 # ЧТЕНИЕ ФАЙЛА
 code = open("code3.cpp", encoding="utf-8").read()
 
+# ============================================================================
 # ЛЕКСИЧЕСКИЙ АНАЛИЗАТОР
+# ============================================================================
 patterns = {
     'PREPROCESSOR': r"#.*",
     'COMMENT': r"//.*|/\*[\s\S]*?\*/",
@@ -47,6 +49,10 @@ def tokenize(code: str):
     tokens.append(("EOF", "EOF"))
     return tokens
 
+# ============================================================================
+# СИНТАКСИЧЕСКИЙ АНАЛИЗАТОР
+# ============================================================================
+
 # УЗЕЛ ДЕРЕВА
 class Node:
     def __init__(self, type_, value=None, param_type=None):
@@ -70,8 +76,19 @@ class Node:
             child.print(indent + 1)
 
 
-# ПАРСЕР
+# РАЗБОР ТОКЕНОВ И ПОСТРОЕНИЕ ДЕРЕВА
 class Parser:
+    # Допустимые бинарные операторы.
+    BINARY_LEVELS = (
+        ("||",),
+        ("&&",),
+        ("==", "!="),
+        ("<", "<=", ">", ">="),
+        ("<<", ">>"),
+        ("+", "-"),
+        ("*", "/", "%"),
+    )
+
     def __init__(self, tokens):
         self.tokens = tokens
         self.pos = 0
@@ -151,33 +168,29 @@ class Parser:
         self.match(value_="(")
         params_node = Node("Parameters")
 
-        current_type = None
-        while self.current()[1] != ")" and self.current()[0] != "EOF":
-            t_type, t_value = self.current()
-
-            if t_type == "KEYWORDS" and t_value in (
-                "int", "float", "double", "char", "bool", "void", "auto",
-                "const", "static", "virtual"
-            ):
-                current_type = t_value
+        if self.current()[1] == "void" and self.peek_next()[1] == ")":
+            self.next()
+        elif self.current()[1] != ")":
+            while True:
+                if self.current()[1] == "const":
+                    self.next()
+                param_type = self.current()[1]
+                if param_type not in ("int", "float", "double", "char", "bool", "void", "auto"):
+                    raise SyntaxError(f"Expected parameter type, got '{param_type}' at token {self.pos}")
                 self.next()
-
-            elif t_type == "IDENTIFIER":
-                params_node.add(Node("Param", t_value, param_type=current_type))
-                current_type = None
-                self.next()
-
-            elif t_value == ",":
-                self.next()
-
-            else:
-                self.next()
+                _, param_name = self.match(type_="IDENTIFIER")
+                params_node.add(Node("Param", param_name, param_type=param_type))
+                if self.current()[1] == ")":
+                    break
+                self.match(value_=",")
 
         func_node.add(params_node)
         self.match(value_=")")
 
         if self.current()[1] == "{":
             func_node.add(self.block())
+        else:
+            self.match(value_=";")
 
         return func_node
 
@@ -202,10 +215,14 @@ class Parser:
             return self.switch_stmt()
         elif value == "try":
             return self.try_catch()
-        elif value in ("int", "float", "double", "char", "bool", "void", "auto"):
+        elif value in ("int", "float", "double", "char", "bool", "void", "auto", "const"):
             return self.declaration()
+        elif self._is_vector_declaration():
+            return self.vector_declaration()
         elif value in ("class", "struct"):
             return self.class_def()
+        elif value == "using":
+            return self.using_namespace_stmt()
         elif value == "namespace":
             return self.namespace_def()
         elif value == "template":
@@ -215,14 +232,22 @@ class Parser:
         elif value in ("break", "continue"):
             node = Node(value.capitalize())
             self.next()
-            if self.current()[1] == ";":
-                self.next()
+            self.match(value_=";")
             return node
         elif value == ";":
             self.next()
             return Node("Empty")
         else:
             return self.expr_stmt()
+
+    def using_namespace_stmt(self):
+        start = self.pos
+        self.match(value_="using")
+        self.match(value_="namespace")
+        self._qualified_identifier()
+        text = self._expression_text(start)
+        self.match(value_=";")
+        return Node("ExprStmt", text)
 
     def block(self):
         node = Node("Block")
@@ -231,8 +256,7 @@ class Parser:
         while self.current()[0] != "EOF" and self.current()[1] != "}":
             node.add(self.statement())
 
-        if self.current()[1] == "}":
-            self.match(value_="}")
+        self.match(value_="}")
 
         return node
 
@@ -276,11 +300,17 @@ class Parser:
         node = Node("For")
         self.match(value_="for")
         self.match(value_="(")
-        node.add(Node("Init", self.expression()))
+        if self.current()[1] in ("int", "float", "double", "char", "bool", "void", "auto", "const"):
+            start = self.pos
+            self.declaration(consume_semicolon=False)
+            init = self._expression_text(start)
+        else:
+            init = self.expression(allow_empty=True)
+        node.add(Node("Init", init))
         self.match(value_=";")
-        node.add(Node("Condition", self.expression()))
+        node.add(Node("Condition", self.expression(allow_empty=True)))
         self.match(value_=";")
-        node.add(Node("Iter", self.expression()))
+        node.add(Node("Iter", self.expression(allow_empty=True)))
         self.match(value_=")")
         node.add(self.statement())
         return node
@@ -343,35 +373,115 @@ class Parser:
 
         return node
 
-    def declaration(self):
+    def declaration(self, consume_semicolon=True):
+        is_const = self.current()[1] == "const"
+        if is_const:
+            self.next()
         var_type = self.current()[1]
+        if var_type not in ("int", "float", "double", "char", "bool", "void", "auto"):
+            raise SyntaxError(f"Expected built-in type, got '{var_type}' at token {self.pos}")
         node = Node("Declaration", var_type)
+        if is_const:
+            node.add(Node("Qualifier", "const"))
         self.next()
 
         while True:
-            if self.current()[0] == "IDENTIFIER":
-                var_node = Node("VarName", self.current()[1])
+            _, name = self.match(type_="IDENTIFIER")
+            var_node = Node("VarName", name)
 
-                if self.peek_next()[1] == "=":
-                    self.next()
-                    self.next()
-                    var_node.add(Node("Value", self.expression()))
-                    node.add(var_node)
-                else:
-                    self.next()
-                    node.add(var_node)
+            if self.current()[1] == "[":
+                var_node = self.array_declaration(var_node.value)
+            elif self.current()[1] == "=":
+                self.next()
+                var_node.add(Node("Value", self.expression()))
+            node.add(var_node)
 
-                if self.current()[1] == ",":
-                    self.next()
-                    continue
-                else:
-                    break
-            else:
+            if self.current()[1] != ",":
                 break
-
-        if self.current()[1] == ";":
             self.next()
 
+        if consume_semicolon:
+            self.match(value_=";")
+
+        return node
+
+    def _is_vector_declaration(self):
+        values = [value for _, value in self.tokens[self.pos:self.pos + 4]]
+        return values[:2] == ["vector", "<"] or values == ["std", "::", "vector", "<"]
+
+    def vector_declaration(self):
+        if self.current()[1] == "std":
+            self.match(value_="std")
+            self.match(value_="::")
+        self.match(value_="vector")
+        self.match(value_="<")
+        element_type = self.current()[1]
+        if element_type not in ("int", "float", "double", "char", "bool"):
+            raise SyntaxError(f"Unsupported vector element type '{element_type}' at token {self.pos}")
+        self.next()
+        self.match(value_=">")
+        node = Node("Declaration", f"vector<{element_type}>")
+
+        while True:
+            _, name = self.match(type_="IDENTIFIER")
+            variable = Node("VectorName", name)
+            if self.current()[1] == "=":
+                self.next()
+                variable.add(self.initializer_list())
+            elif self.current()[1] == "{":
+                variable.add(self.initializer_list())
+            elif self.current()[1] == "(":
+                self.next()
+                arguments = Node("ConstructorArgs")
+                arguments.add(Node("Value", self.expression()))
+                while self.current()[1] == ",":
+                    self.next()
+                    arguments.add(Node("Value", self.expression()))
+                self.match(value_=")")
+                variable.add(arguments)
+            node.add(variable)
+            if self.current()[1] != ",":
+                break
+            self.next()
+
+        self.match(value_=";")
+        return node
+
+    def array_declaration(self, name):
+        node = Node("ArrayName", name)
+        while self.current()[1] == "[":
+            self.match(value_="[")
+            node.add(Node("Dimension", self.expression(allow_empty=True)))
+            self.match(value_="]")
+
+        if self.current()[1] == "=":
+            self.next()
+            if self.current()[0] == "STRING":
+                node.add(Node("Value", self.match(type_="STRING")[1]))
+            else:
+                node.add(self.initializer_list())
+        elif self.current()[1] == "{":
+            node.add(self.initializer_list())
+
+        if self.current()[1] not in (",", ";"):
+            raise SyntaxError(f"Expected ',' or ';' after array '{name}' at token {self.pos}")
+        return node
+
+    def initializer_list(self):
+        node = Node("InitializerList")
+        self.match(value_="{")
+        while self.current()[1] != "}":
+            if self.current()[1] == "{":
+                node.add(self.initializer_list())
+            else:
+                value = self.expression()
+                if value is None:
+                    raise SyntaxError(f"Expected array initializer element at token {self.pos}")
+                node.add(Node("Value", value))
+            if self.current()[1] != ",":
+                break
+            self.next()
+        self.match(value_="}")
         return node
 
     def class_def(self):
@@ -399,8 +509,7 @@ class Parser:
                     node.add(self.statement())
             self.match(value_="}")
 
-        if self.current()[1] == ";":
-            self.next()
+        self.match(value_=";")
 
         return node
 
@@ -434,28 +543,78 @@ class Parser:
     def expr_stmt(self):
         expr = self.expression()
         node = Node("ExprStmt", expr if expr else "empty")
-        if self.current()[1] == ";":
-            self.next()
+        self.match(value_=";")
         return node
 
-    def expression(self):
-        parts = []
-        depth = 0
+    def expression(self, allow_empty=False):
+        delimiters = (";", "}", ")", "]", ":", ",")
+        if allow_empty and (self.current()[1] in delimiters or self.current()[0] == "EOF"):
+            return None
+        start = self.pos
+        self._assignment_expression()
+        if self.current()[0] != "EOF" and self.current()[1] not in delimiters:
+            raise SyntaxError(f"Unexpected token '{self.current()[1]}' after expression at token {self.pos}")
+        return self._expression_text(start)
 
-        while self.current()[0] != "EOF":
-            t_type, value = self.current()
+    def _expression_text(self, start):
+        # Семантика и генератор по-прежнему получают исходные токены как строку.
+        return " ".join(value for _, value in self.tokens[start:self.pos])
 
-            if value in (";", "}", ")", ":", ",") and depth == 0:
+    def _assignment_expression(self):
+        self._binary_expression()
+        if self.current()[1] in ("=", "+=", "-=", "*=", "/="):
+            self.next()
+            # Присваивание группируется справа: a = (b = 1).
+            self._assignment_expression()
+
+    def _binary_expression(self):
+        self._unary_expression()
+        while any(self.current()[1] in operators for operators in self.BINARY_LEVELS):
+            self.next()
+            self._unary_expression()
+
+    def _unary_expression(self):
+        if self.current()[1] in ("+", "-", "!", "++", "--"):
+            self.next()
+            self._unary_expression()
+        else:
+            self._postfix_expression()
+
+    def _postfix_expression(self):
+        self._primary_expression()
+        while True:
+            if self.current()[1] == "[":
+                self.next()
+                self.expression()
+                self.match(value_="]")
+            elif self.current()[1] == "(":
+                self.next()
+                if self.current()[1] != ")":
+                    self.expression()
+                    while self.current()[1] == ",":
+                        self.next()
+                        self.expression()
+                self.match(value_=")")
+            elif self.current()[1] in ("++", "--"):
+                self.next()
+            else:
                 break
 
-            if value in ("(", "[", "{"):
-                depth += 1
-            elif value in (")", "]", "}"):
-                depth -= 1
-                if depth < 0:
-                    break
-
-            parts.append(value)
+    def _primary_expression(self):
+        kind, value = self.current()
+        if kind in ("NUMBER", "STRING", "CHAR"):
             self.next()
+        elif kind == "IDENTIFIER":
+            self._qualified_identifier()
+        elif value == "(":
+            self.next()
+            self.expression()
+            self.match(value_=")")
+        else:
+            raise SyntaxError(f"Expected expression, got '{value}' at token {self.pos}")
 
-        return " ".join(parts) if parts else None
+    def _qualified_identifier(self):
+        self.match(type_="IDENTIFIER")
+        while self.current()[1] == "::":
+            self.next()
+            self.match(type_="IDENTIFIER")
