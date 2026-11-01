@@ -137,10 +137,11 @@ class SemanticAnalyzer:
             element_type = var_type
             container = None
             dimensions = []
+            known_dimensions = []
             if child.type == "ArrayName":
                 container = "array"
                 dimensions = [dim.value for dim in child.children if dim.type == "Dimension"]
-                self.check_array_dimensions(child, dimensions)
+                known_dimensions = self.check_array_dimensions(child, dimensions)
             elif child.type == "VectorName":
                 container = "vector"
                 element_type = var_type[len("vector<"):-1]
@@ -154,35 +155,93 @@ class SemanticAnalyzer:
                     if sub.type == "Value":
                         expr_type = self.eval_expr(sub.value)
                         self.check_assign(var_type, expr_type, child.value)
+            else:
+                self.check_container_initializer(child, symbol, known_dimensions)
+
+    def check_container_initializer(self, node, symbol, dimensions):
+        initializer = next((child for child in node.children if child.type in ("InitializerList", "Value")), None)
+        if initializer is None:
+            return
+        if initializer.type == "Value":
+            if symbol.container != "array" or symbol.type != "char" or len(dimensions) != 1:
+                raise SemanticError(f"Строкой можно инициализировать только одномерный char-массив: '{symbol.name}'")
+            content = initializer.value[1:-1]
+            # Одна escape-последовательность C++ занимает один элемент массива.
+            characters = re.findall(r'''\\(?:[0-7]{1,3}|x[0-9a-fA-F]+|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|['"?\\abfnrtv])|[^\\\r\n]''', content)
+            if "".join(characters) != content:
+                raise SemanticError(f"Некорректная или неподдерживаемая escape-последовательность в '{symbol.name}'")
+            count = len(characters) + 1  # Включая завершающий нулевой символ.
+        else:
+            count = len(initializer.children)
+
+        if symbol.container == "array" and symbol.dimensions[0] is None:
+            if count == 0:
+                raise SemanticError(f"Нельзя определить положительный размер массива '{symbol.name}' из пустого списка")
+            symbol.dimensions[0] = str(count)
+            dimensions[0] = count
+
+        if initializer.type == "Value":
+            if dimensions[0] is not None and count > dimensions[0]:
+                raise SemanticError(f"Строка не помещается в массив '{symbol.name}': требуется {count}, размер {dimensions[0]}")
+        else:
+            # У вектора нет фиксированной вместимости списка начальных значений.
+            self._check_initializer_list(initializer, symbol.type,
+                                         dimensions if symbol.container == "array" else [None], symbol.name)
+
+    def _check_initializer_list(self, node, element_type, dimensions, name):
+        if dimensions[0] is not None and len(node.children) > dimensions[0]:
+            raise SemanticError(f"Слишком много начальных значений для '{name}': размер {dimensions[0]}, значений {len(node.children)}")
+        for child in node.children:
+            if len(dimensions) > 1:
+                if child.type != "InitializerList":
+                    raise SemanticError(f"Для двумерного массива '{name}' нужны вложенные списки инициализации")
+                self._check_initializer_list(child, element_type, dimensions[1:], name)
+            else:
+                if child.type != "Value":
+                    raise SemanticError(f"Лишняя вложенность списка инициализации '{name}'")
+                try:
+                    parsed, source = self._parse_container_expression(child.value)
+                    actual_type, _ = self._container_expression_info(parsed, source)
+                except (SyntaxError, ValueError) as error:
+                    raise SemanticError(f"Неподдерживаемое начальное выражение для '{name}': {child.value}") from error
+                self.check_assign(element_type, actual_type, name)
 
     def check_array_dimensions(self, node, dimensions):
         if len(dimensions) not in (1, 2):
             raise SemanticError(f"Массив '{node.value}' должен иметь одно или два измерения")
         has_initializer = any(child.type in ("InitializerList", "Value") for child in node.children)
+        known_dimensions = []
         for index, expression in enumerate(dimensions):
             if expression is None:
                 if index != 0 or not has_initializer:
                     raise SemanticError(f"У массива '{node.value}' можно пропустить только первый размер при наличии инициализации")
+                known_dimensions.append(None)
                 continue
-            # Python AST используется только для арифметики; имена C++ вроде
-            # True или lambda временно получают префикс, строки не изменяются.
-            # Целые литералы с ведущим нулём читаются по правилам C++ (основание 8).
             try:
-                source = re.sub(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b0[0-9]+\b(?!\.)|\b[A-Za-z_]\w*\b''',
-                                lambda match: (match[0] if match[0][0] in "\"'" else
-                                               str(int(match[0], 8)) if match[0][0].isdigit() else
-                                               "_size_" + match[0]), expression)
-                parsed = ast.parse(source, mode="eval").body
+                parsed, source = self._parse_container_expression(expression)
             except (SyntaxError, ValueError) as error:
                 raise SemanticError(f"Неподдерживаемое выражение размера массива '{node.value}': {expression}") from error
-            type_, value = self._array_size_expression(parsed, source)
+            type_, value = self._container_expression_info(parsed, source)
             if type_ != "int":
                 raise SemanticError(f"Размер массива '{node.value}' должен иметь тип int, получен {type_}")
             if value is not None and value <= 0:
                 raise SemanticError(f"Размер массива '{node.value}' должен быть положительным, получен {value}")
+            known_dimensions.append(value)
+        return known_dimensions
 
-    def _array_size_expression(self, node, source):
-        """Возвращает тип и известное целое значение; None означает размер времени выполнения."""
+    @staticmethod
+    def _parse_container_expression(expression):
+        # Не смешиваем имена C++ (например, True и lambda) с ключевыми словами Python.
+        # Литералы с ведущим нулём переводим из восьмеричной записи C++.
+        source = re.sub(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b0[0-9]+\b(?!\.)|\b[A-Za-z_]\w*\b''',
+                        lambda match: ("'?'" if match[0] == r"'\?'" else
+                                       match[0] if match[0][0] in "\"'" else
+                                       str(int(match[0], 8)) if match[0][0].isdigit() else
+                                       "_size_" + match[0]), expression)
+        return ast.parse(source, mode="eval").body, source
+
+    def _container_expression_info(self, node, source):
+        """Тип выражения и известное целое значение для размеров и инициализаторов."""
         if isinstance(node, ast.Constant):
             if type(node.value) is int:
                 return "int", node.value
@@ -199,9 +258,9 @@ class SemanticAnalyzer:
                 return "bool", int(name == "true")
             symbol = self.table.lookup(name)
             if symbol is None:
-                raise SemanticError(f"Необъявленное имя в размере массива: '{name}'")
+                raise SemanticError(f"Необъявленное имя в выражении: '{name}'")
             if symbol.container or symbol.kind == "func":
-                raise SemanticError(f"В размере массива нужен элемент контейнера или вызов функции, а не '{name}' целиком")
+                raise SemanticError(f"В выражении нужен элемент контейнера или вызов функции, а не '{name}' целиком")
             return symbol.type, None
         elif isinstance(node, ast.Subscript):
             base, indices = node, []
@@ -210,52 +269,54 @@ class SemanticAnalyzer:
                 base = base.value
             symbol = self.table.lookup(base.id[len("_size_"):]) if isinstance(base, ast.Name) else None
             if symbol is None or not symbol.container:
-                raise SemanticError("В размере массива индексируется необъявленный контейнер или обычная переменная")
+                raise SemanticError("В выражении индексируется необъявленный контейнер или обычная переменная")
             rank = len(symbol.dimensions) if symbol.container == "array" else 1
             if len(indices) != rank:
-                raise SemanticError("В размере массива нужно указать отдельный элемент контейнера")
+                raise SemanticError("В выражении нужно указать отдельный элемент контейнера")
             for index in indices:
-                self._array_size_expression(index, source)
+                self._container_expression_info(index, source)
             return symbol.type, None
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             name = node.func.id[len("_size_"):]
             symbol = self.table.lookup(name)
             if symbol is None or symbol.kind != "func":
-                raise SemanticError(f"Необъявленная функция в размере массива: '{name}'")
+                raise SemanticError(f"Необъявленная функция в выражении: '{name}'")
             if node.keywords or len(node.args) != len(symbol.params):
-                raise SemanticError(f"Неверное число аргументов функции '{name}' в размере массива")
+                raise SemanticError(f"Неверное число аргументов функции '{name}' в выражении")
             for argument in node.args:
-                self._array_size_expression(argument, source)
+                self._container_expression_info(argument, source)
             return symbol.return_type, None
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-            type_, value = self._array_size_expression(node.operand, source)
+            type_, value = self._container_expression_info(node.operand, source)
             if type_ not in NUMERIC:
-                raise SemanticError("Унарная операция в размере массива требует числовой операнд")
+                raise SemanticError("Унарная операция требует числовой операнд")
             return ("int" if type_ in ("char", "bool") else type_,
                     -value if value is not None and isinstance(node.op, ast.USub) else value)
         elif isinstance(node, ast.BinOp):
-            left_type, left = self._array_size_expression(node.left, source)
-            right_type, right = self._array_size_expression(node.right, source)
+            left_type, left = self._container_expression_info(node.left, source)
+            right_type, right = self._container_expression_info(node.right, source)
             if left_type not in NUMERIC or right_type not in NUMERIC:
-                raise SemanticError("Арифметика в размере массива требует числовые операнды")
+                raise SemanticError("Арифметика требует числовые операнды")
             integer = ("int", "char", "bool")
             if isinstance(node.op, (ast.Mod, ast.LShift, ast.RShift)) and (left_type not in integer or right_type not in integer):
-                raise SemanticError("Остаток и сдвиги в размере массива требуют целочисленные операнды")
+                raise SemanticError("Остаток и сдвиги требуют целочисленные операнды")
             result_type = "double" if "double" in (left_type, right_type) else "float" if "float" in (left_type, right_type) else "int"
-            value = self._array_size_operation(node.op, left, right)
+            value = self._integer_operation(node.op, left, right)
             return result_type, value
         elif isinstance(node, ast.Compare):
             for operand in (node.left, *node.comparators):
-                self._array_size_expression(operand, source)
+                type_, _ = self._container_expression_info(operand, source)
+                if type_ not in NUMERIC:
+                    raise SemanticError("Сравнение требует числовые операнды")
             return "bool", None
-        raise SemanticError("Неподдерживаемая операция в выражении размера массива")
+        raise SemanticError("Неподдерживаемая операция в выражении")
 
     @staticmethod
-    def _array_size_operation(operation, left, right):
+    def _integer_operation(operation, left, right):
         if isinstance(operation, (ast.Div, ast.Mod)) and right == 0:
-            raise SemanticError("Деление на ноль в выражении размера массива")
+            raise SemanticError("Деление на ноль в выражении")
         if isinstance(operation, (ast.LShift, ast.RShift)) and right is not None and right < 0:
-            raise SemanticError("Отрицательный сдвиг в выражении размера массива")
+            raise SemanticError("Отрицательный сдвиг в выражении")
         if left is None or right is None:
             return None
         if isinstance(operation, ast.Add):
@@ -271,7 +332,7 @@ class SemanticAnalyzer:
             return left << right
         if isinstance(operation, ast.RShift):
             return left >> right
-        raise SemanticError("Неподдерживаемая арифметическая операция в размере массива")
+        raise SemanticError("Неподдерживаемая арифметическая операция в выражении")
 
     # ---------- for: инициализация ----------
     def visit_Init(self, node):
