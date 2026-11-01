@@ -160,8 +160,25 @@ class SemanticAnalyzer:
                 self.check_container_initializer(child, symbol, known_dimensions)
 
     def check_container_initializer(self, node, symbol, dimensions):
-        initializer = next((child for child in node.children if child.type in ("InitializerList", "Value")), None)
+        initializer = next((child for child in node.children if child.type in ("InitializerList", "Value", "ConstructorArgs")), None)
         if initializer is None:
+            return
+        if initializer.type == "ConstructorArgs":
+            if len(initializer.children) not in (1, 2):
+                raise SemanticError(f"Конструктор вектора '{symbol.name}' ожидает один или два аргумента")
+            for index, argument in enumerate(initializer.children):
+                try:
+                    parsed, source = self._parse_container_expression(argument.value)
+                    type_, value = self._container_expression_info(parsed, source)
+                except (SyntaxError, ValueError) as error:
+                    raise SemanticError(f"Неподдерживаемый аргумент конструктора вектора '{symbol.name}': {argument.value}") from error
+                if index == 0:
+                    if type_ != "int":
+                        raise SemanticError(f"Размер вектора '{symbol.name}' должен иметь тип int, получен {type_}")
+                    if value is not None and value < 0:
+                        raise SemanticError(f"Размер вектора '{symbol.name}' не может быть отрицательным, получен {value}")
+                else:
+                    self.check_assign(symbol.type, type_, symbol.name)
             return
         if initializer.type == "Value":
             if symbol.container != "array" or symbol.type != "char" or len(dimensions) != 1:
