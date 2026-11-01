@@ -48,11 +48,13 @@ class PythonCodeGenerator:
             self.used_names.update(re.findall(r"[A-Za-z_]\w*", str(node.value or "")))
             if node.type == "Declaration":
                 for child in node.children:
-                    if child.type == "ArrayName" and sum(c.type == "Dimension" for c in child.children) == 1:
+                    if child.type == "ArrayName" and sum(c.type == "Dimension" for c in child.children) in (1, 2):
                         initializer = next((c for c in child.children if c.type == "InitializerList"), None)
                         if initializer is not None:
+                            values = [value for item in initializer.children
+                                      for value in (item.children if item.type == "InitializerList" else [item])]
                             needs_array_casts |= any(self.array_literal(c.value, node.value) is None
-                                                     for c in initializer.children)
+                                                     for c in values)
             pending.extend(node.children)
 
         # self.emit("# -*- coding: utf-8 -*-")
@@ -151,8 +153,12 @@ class PythonCodeGenerator:
                     self.emit(f"{name} = {expr}")
                 else:
                     self.emit(f"{name} = {self.DEFAULTS.get(var_type, 'None')}")
-            elif child.type == "ArrayName" and sum(c.type == "Dimension" for c in child.children) == 1:
-                self.gen_array_1d(child, var_type)
+            elif child.type == "ArrayName":
+                rank = sum(c.type == "Dimension" for c in child.children)
+                if rank == 1:
+                    self.gen_array_1d(child, var_type)
+                elif rank == 2:
+                    self.gen_array_2d(child, var_type)
 
     def gen_array_1d(self, node, var_type):
         # Строковая инициализация char[] будет добавлена отдельным этапом.
@@ -179,10 +185,54 @@ class PythonCodeGenerator:
             size = self.new_temp()
             self.emit(f"{size} = {size_expr}")
 
+        result = self.array_values(values, var_type, size, known_size)
+        self.emit(f"{node.value} = {result}")
+
+    def gen_array_2d(self, node, var_type):
+        initializer = next((child for child in node.children if child.type == "InitializerList"), None)
+        rows = initializer.children if initializer is not None else []
+        symbol = getattr(node, "symbol", None)
+        if symbol is not None:
+            var_type = symbol.type
+            dimensions, known_sizes = symbol.dimensions, list(symbol.known_dimensions)
+        else:
+            dimensions = [child.value for child in node.children if child.type == "Dimension"]
+            known_sizes = [(int(value, 8 if value.startswith("0") else 10)
+                            if value is not None and value.isdecimal() else None) for value in dimensions]
+        if dimensions[0] is None:
+            known_sizes[0] = len(rows)
+
+        sizes = []
+        for expression, known_size in zip(dimensions, known_sizes):
+            if known_size is not None:
+                sizes.append(str(known_size))
+            else:
+                translated = self.translate_array_expr(expression)
+                size = self.new_temp()
+                self.emit(f"{size} = {translated}")
+                sizes.append(size)
+
+        row_values = [self.array_values(row.children, var_type, sizes[1], known_sizes[1], True)
+                      for row in rows]
+        empty_row = self.array_values([], var_type, sizes[1], known_sizes[1], True)
+        if known_sizes[0] is not None:
+            row_values.extend([empty_row] * (known_sizes[0] - len(rows)))
+            result = f"[{', '.join(row_values)}]"
+        else:
+            item = self.new_temp()
+            if row_values:
+                result = (f"[{', '.join(row_values)}] + "
+                          f"[{empty_row} for {item} in [0] * ({sizes[0]} - {len(rows)})]")
+            else:
+                result = f"[{empty_row} for {item} in [0] * {sizes[0]}]"
+        self.emit(f"{node.value} = {result}")
+
+    def array_values(self, values, var_type, size, known_size, expand_empty=False):
         default = repr("\0") if var_type == "char" else self.DEFAULTS.get(var_type, "None")
         if not values:
-            self.emit(f"{node.value} = [{default}] * {size}")
-            return
+            if expand_empty and known_size is not None:
+                return f"[{', '.join([default] * known_size)}]"
+            return f"[{default}] * {size}"
 
         literals = [self.array_literal(value.value, var_type) for value in values]
         if all(value is not None for value in literals):
@@ -203,7 +253,7 @@ class PythonCodeGenerator:
             result = f"[{casts.get(var_type, item)} for {item} in [{', '.join(expressions)}]]"
         if known_size != len(literals):
             result += f" + [{default}] * ({size} - {len(values)})"
-        self.emit(f"{node.value} = {result}")
+        return result
 
     def array_literal(self, text, var_type):
         if re.fullmatch(r'''(?:true|false|[+-]?\s*(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?)|'(?:\\.|[^'\\])')''', text.strip()) is None:
