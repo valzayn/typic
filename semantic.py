@@ -19,7 +19,7 @@ COMPATIBLE = {
 
 class Symbol:
     def __init__(self, name, type_, kind="var", params=None, return_type=None, scope="global",
-                 container=None, dimensions=None):
+                 container=None, dimensions=None, known_dimensions=None):
         self.name = name
         self.type = type_
         self.kind = kind
@@ -28,6 +28,7 @@ class Symbol:
         self.scope = scope
         self.container = container
         self.dimensions = list(dimensions) if dimensions is not None else []
+        self.known_dimensions = list(known_dimensions) if known_dimensions is not None else []
 
 
 class SymbolTable:
@@ -146,7 +147,7 @@ class SemanticAnalyzer:
                 container = "vector"
                 element_type = var_type[len("vector<"):-1]
             symbol = Symbol(child.value, element_type, scope=self.table.current_scope(),
-                            container=container, dimensions=dimensions)
+                            container=container, dimensions=dimensions, known_dimensions=known_dimensions)
             self.table.declare(symbol)
             # Локальная область будет удалена из таблицы, но символ останется в дереве.
             child.symbol = symbol
@@ -179,6 +180,7 @@ class SemanticAnalyzer:
                 raise SemanticError(f"Нельзя определить положительный размер массива '{symbol.name}' из пустого списка")
             symbol.dimensions[0] = str(count)
             dimensions[0] = count
+            symbol.known_dimensions[0] = count
 
         if initializer.type == "Value":
             if dimensions[0] is not None and count > dimensions[0]:
@@ -241,7 +243,7 @@ class SemanticAnalyzer:
         return ast.parse(source, mode="eval").body, source
 
     def _container_expression_info(self, node, source):
-        """Тип выражения и известное целое значение для размеров и инициализаторов."""
+        """Тип выражения и известное целое значение для размеров, инициализации и индексов."""
         if isinstance(node, ast.Constant):
             if type(node.value) is int:
                 return "int", node.value
@@ -273,8 +275,13 @@ class SemanticAnalyzer:
             rank = len(symbol.dimensions) if symbol.container == "array" else 1
             if len(indices) != rank:
                 raise SemanticError("В выражении нужно указать отдельный элемент контейнера")
-            for index in indices:
-                self._container_expression_info(index, source)
+            for dimension, index in enumerate(reversed(indices)):
+                index_type, value = self._container_expression_info(index, source)
+                if index_type != "int":
+                    raise SemanticError(f"Индекс '{symbol.name}' должен иметь тип int, получен {index_type}")
+                size = symbol.known_dimensions[dimension] if symbol.container == "array" else None
+                if value is not None and (value < 0 or (size is not None and value >= size)):
+                    raise SemanticError(f"Индекс {value} выходит за границы '{symbol.name}', измерение {dimension + 1}")
             return symbol.type, None
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             name = node.func.id[len("_size_"):]
@@ -405,6 +412,8 @@ class SemanticAnalyzer:
         if node.value and node.value != "empty":
             self.eval_expr(node.value)
 
+    visit_Iter = visit_ExprStmt
+
     def visit_Empty(self, node):
         pass
 
@@ -432,13 +441,46 @@ class SemanticAnalyzer:
         return src in COMPATIBLE.get(dst, set())
 
     # ---------- вычисление типа выражения ----------
+    def _check_element_accesses(self, text):
+        if "[" not in text:
+            return []
+        # Выделяем обращения вне строк; сами индексы разбирает общий обработчик выражений.
+        tokens = list(re.finditer(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z_]\w*|\S''', text))
+        stack, starts, spans = [], {}, []
+        for position, token in enumerate(tokens):
+            if token[0] in ("(", "["):
+                stack.append(position)
+            elif token[0] in (")", "]"):
+                if not stack:
+                    raise SemanticError("Незакрытые скобки в выражении")
+                opening = stack.pop()
+                start = opening
+                previous = opening - 1
+                if previous >= 0 and (previous in starts or re.fullmatch(r"[A-Za-z_]\w*", tokens[previous][0])):
+                    start = starts.get(previous, previous)
+                starts[position] = start
+                if token[0] == "]":
+                    begin, end = tokens[start].start(), token.end()
+                    # Внешнее обращение включает проверки вложенных индексов и всей цепочки [].
+                    while spans and spans[-1][0] >= begin:
+                        spans.pop()
+                    spans.append((begin, end))
+        for begin, end in spans:
+            try:
+                parsed, source = self._parse_container_expression(text[begin:end])
+                self._container_expression_info(parsed, source)
+            except (SyntaxError, ValueError) as error:
+                raise SemanticError(f"Неподдерживаемое обращение к элементу: {text[begin:end]}") from error
+        return spans
+
     def eval_expr(self, expr_text):
         if not expr_text:
             return "unknown"
         text = expr_text.strip()
+        accesses = self._check_element_accesses(text)
 
         # cout / cin — не проверяем как обычное выражение
-        if text.lstrip().startswith(("cout", "cin")):
+        if re.match(r"^(?:std\s*::\s*)?(?:cout|cin)\b", text):
             return "unknown"
 
         # присваивание
@@ -447,11 +489,23 @@ class SemanticAnalyzer:
             left = text[:assign].strip()
             right = text[assign + 1:].strip()
             sym = self.table.lookup(left)
-            if sym is None:
+            if any(end <= assign for _, end in accesses):
+                try:
+                    parsed, source = self._parse_container_expression(left)
+                except (SyntaxError, ValueError) as error:
+                    raise SemanticError(f"Неподдерживаемая левая часть присваивания: '{left}'") from error
+                if not isinstance(parsed, ast.Subscript):
+                    raise SemanticError(f"Слева от присваивания нужен элемент контейнера: '{left}'")
+                left_type, _ = self._container_expression_info(parsed, source)
+            elif sym is None:
                 raise SemanticError(f"Присваивание необъявленной переменной '{left}'")
+            else:
+                if sym.container:
+                    raise SemanticError(f"Нельзя присваивать контейнеру '{left}' целиком")
+                left_type = sym.type
             rhs_type = self.eval_expr(right)
-            self.check_assign(sym.type, rhs_type, left)
-            return sym.type
+            self.check_assign(left_type, rhs_type, left)
+            return left_type
 
         # литералы
         if text.startswith('"') and text.endswith('"'):
@@ -472,6 +526,15 @@ class SemanticAnalyzer:
         except ValueError:
             pass
 
+        if accesses:
+            try:
+                parsed, source = self._parse_container_expression(text)
+            except (SyntaxError, ValueError):
+                # Логика C++ и ++/-- остаются в существующей обработке ниже.
+                pass
+            else:
+                return self._container_expression_info(parsed, source)[0]
+
         # вызов функции
         m = re.match(r"^([A-Za-z_]\w*)\s*\((.*)\)$", text)
         if m:
@@ -488,6 +551,9 @@ class SemanticAnalyzer:
             if len(args_list) != len(sym.params):
                 raise SemanticError(
                     f"Функция '{fname}' ожидает {len(sym.params)} аргументов, передано {len(args_list)}")
+            if accesses:
+                for argument in args_list:
+                    self.eval_expr(argument)
             return sym.return_type or "unknown"
 
         # идентификатор
@@ -495,7 +561,14 @@ class SemanticAnalyzer:
             sym = self.table.lookup(text)
             if sym is None:
                 raise SemanticError(f"Использование необъявленного идентификатора '{text}'")
+            if sym.container:
+                raise SemanticError(f"В выражении нужен элемент контейнера '{text}'")
             return sym.type
+
+        if accesses:
+            # Имена и литералы внутри индексов уже проверены выше.
+            for begin, end in reversed(accesses):
+                text = text[:begin] + "0" + text[end:]
 
         # сравнения / логика -> bool
         if any(op in text for op in ("==", "!=", "<=", ">=", "&&", "||", "<", ">")):
