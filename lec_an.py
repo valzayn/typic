@@ -351,15 +351,14 @@ class Parser:
         while True:
             if self.current()[0] == "IDENTIFIER":
                 var_node = Node("VarName", self.current()[1])
+                self.next()
 
-                if self.peek_next()[1] == "=":
-                    self.next()
+                if self.current()[1] == "[":
+                    var_node = self.array_declaration(var_node.value)
+                elif self.current()[1] == "=":
                     self.next()
                     var_node.add(Node("Value", self.expression()))
-                    node.add(var_node)
-                else:
-                    self.next()
-                    node.add(var_node)
+                node.add(var_node)
 
                 if self.current()[1] == ",":
                     self.next()
@@ -372,6 +371,35 @@ class Parser:
         if self.current()[1] == ";":
             self.next()
 
+        return node
+
+    def array_declaration(self, name):
+        node = Node("ArrayName", name)
+        self.match(value_="[")
+        node.add(Node("Dimension", self.expression()))
+        self.match(value_="]")
+        if self.current()[1] == "[":
+            raise SyntaxError("Only one-dimensional array declarations are supported at this stage")
+
+        if self.current()[1] == "=":
+            self.next()
+            self.match(value_="{")
+            initializer = Node("InitializerList")
+            while self.current()[1] != "}":
+                if self.current()[1] == "{":
+                    raise SyntaxError("Nested array initializer lists are not supported at this stage")
+                value = self.expression()
+                if value is None:
+                    raise SyntaxError(f"Expected array initializer element at token {self.pos}")
+                initializer.add(Node("Value", value))
+                if self.current()[1] != ",":
+                    break
+                self.next()
+            self.match(value_="}")
+            node.add(initializer)
+
+        if self.current()[1] not in (",", ";"):
+            raise SyntaxError(f"Expected ',' or ';' after array '{name}' at token {self.pos}")
         return node
 
     def class_def(self):
