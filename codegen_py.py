@@ -1,3 +1,4 @@
+import ast
 import re
 
 
@@ -14,6 +15,8 @@ class PythonCodeGenerator:
         self.indent = 0
         self.temp_count = 0
         self.var_types = {}
+        self.used_names = set()
+        self.array_builtins = None
 
     # ---------- утилиты ----------
     def emit(self, line=""):
@@ -24,6 +27,8 @@ class PythonCodeGenerator:
 
     def new_temp(self):
         self.temp_count += 1
+        while f"_t{self.temp_count}" in self.used_names:
+            self.temp_count += 1
         return f"_t{self.temp_count}"
 
     def push(self):
@@ -37,9 +42,26 @@ class PythonCodeGenerator:
         if symbol_table:
             self._load_types(symbol_table)
 
-        self.emit("# -*- coding: utf-8 -*-")
-        self.emit("# Сгенерировано транслятором C++ -> Python")
-        self.emit("")
+        pending, needs_array_casts = [tree], False
+        while pending:
+            node = pending.pop()
+            self.used_names.update(re.findall(r"[A-Za-z_]\w*", str(node.value or "")))
+            if node.type == "Declaration":
+                for child in node.children:
+                    if child.type == "ArrayName" and sum(c.type == "Dimension" for c in child.children) == 1:
+                        initializer = next((c for c in child.children if c.type == "InitializerList"), None)
+                        if initializer is not None:
+                            needs_array_casts |= any(self.array_literal(c.value, node.value) is None
+                                                     for c in initializer.children)
+            pending.extend(node.children)
+
+        # self.emit("# -*- coding: utf-8 -*-")
+        # self.emit("# Сгенерировано транслятором C++ -> Python")
+        # self.emit("")
+        if needs_array_casts:
+            self.array_builtins = self.new_temp()
+            self.emit(f"import builtins as {self.array_builtins}")
+            self.emit("")
 
         self.visit(tree)
 
@@ -78,11 +100,12 @@ class PythonCodeGenerator:
             self.visit(child)
 
     def gen_Preprocessor(self, node):
-        text = node.value
-        if "iostream" in text:
-            self.emit("# #include <iostream> -> встроенный print()")
-        else:
-            self.emit(f"# {text}")
+        # text = node.value
+        # if "iostream" in text:
+        #     self.emit("# #include <iostream> -> встроенный print()")
+        # else:
+        #     self.emit(f"# {text}")
+        pass
 
     def gen_Block(self, node):
         for child in node.children:
@@ -128,6 +151,86 @@ class PythonCodeGenerator:
                     self.emit(f"{name} = {expr}")
                 else:
                     self.emit(f"{name} = {self.DEFAULTS.get(var_type, 'None')}")
+            elif child.type == "ArrayName" and sum(c.type == "Dimension" for c in child.children) == 1:
+                self.gen_array_1d(child, var_type)
+
+    def gen_array_1d(self, node, var_type):
+        # Строковая инициализация char[] будет добавлена отдельным этапом.
+        if any(child.type == "Value" for child in node.children):
+            return
+        symbol = getattr(node, "symbol", None)
+        if symbol is not None:
+            var_type = symbol.type
+            dimension = symbol.dimensions[0]
+            known_size = symbol.known_dimensions[0]
+        else:
+            dimension = next(child.value for child in node.children if child.type == "Dimension")
+            known_size = (int(dimension, 8 if dimension.startswith("0") else 10)
+                          if dimension is not None and dimension.isdecimal() else None)
+
+        initializer = next((child for child in node.children if child.type == "InitializerList"), None)
+        values = initializer.children if initializer is not None else []
+        if dimension is None:
+            known_size = len(values)
+        if known_size is not None:
+            size = str(known_size)
+        else:
+            size_expr = self.translate_array_expr(dimension)
+            size = self.new_temp()
+            self.emit(f"{size} = {size_expr}")
+
+        default = repr("\0") if var_type == "char" else self.DEFAULTS.get(var_type, "None")
+        if not values:
+            self.emit(f"{node.value} = [{default}] * {size}")
+            return
+
+        literals = [self.array_literal(value.value, var_type) for value in values]
+        if all(value is not None for value in literals):
+            if known_size is not None:
+                literals.extend([default] * (known_size - len(literals)))
+            result = f"[{', '.join(literals)}]"
+        else:
+            expressions = [self.translate_array_expr(value.value) for value in values]
+            item = self.new_temp()
+            builtins = self.array_builtins
+            casts = {
+                "int": f"{builtins}.int({builtins}.ord({item}) if {builtins}.isinstance({item}, {builtins}.str) else {item})",
+                "float": f"{builtins}.float({item})",
+                "double": f"{builtins}.float({item})",
+                "bool": f"{builtins}.bool({item})",
+                "char": f"{builtins}.chr({item}) if {builtins}.isinstance({item}, {builtins}.int) else {item}",
+            }
+            result = f"[{casts.get(var_type, item)} for {item} in [{', '.join(expressions)}]]"
+        if known_size != len(literals):
+            result += f" + [{default}] * ({size} - {len(values)})"
+        self.emit(f"{node.value} = {result}")
+
+    def array_literal(self, text, var_type):
+        if re.fullmatch(r'''(?:true|false|[+-]?\s*(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?)|'(?:\\.|[^'\\])')''', text.strip()) is None:
+            return None
+        try:
+            value = ast.literal_eval(self.translate_array_expr(text))
+            if var_type == "int":
+                value = int(ord(value) if isinstance(value, str) else value)
+            elif var_type in ("float", "double"):
+                value = float(value)
+            elif var_type == "bool":
+                value = bool(value)
+            elif var_type == "char":
+                value = chr(value) if isinstance(value, int) else value
+            else:
+                return None
+        except (SyntaxError, ValueError, TypeError, OverflowError):
+            return None
+        result = repr(value)
+        return result if result not in ("inf", "-inf", "nan") else None
+
+    def translate_array_expr(self, text):
+        # Запись восьмеричных чисел и escape-последовательности \? отличается в Python.
+        text = re.sub(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b0[0-9]+\b(?!\.)''',
+                      lambda match: ("'?'" if match[0] == r"'\?'" else
+                                     match[0] if match[0][0] in "\"'" else "0o" + match[0][1:]), text)
+        return self.translate_expr(text)
 
     # ---------- if / else ----------
     def gen_If(self, node):
@@ -344,7 +447,8 @@ class PythonCodeGenerator:
     @staticmethod
     def _find_assign(text):
         depth = 0
-        for i, ch in enumerate(text):
+        for token in re.finditer(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[\s\S]''', text):
+            i, ch = token.start(), token[0]
             if ch in "([{":
                 depth += 1
             elif ch in ")]}":
@@ -360,7 +464,7 @@ class PythonCodeGenerator:
     @staticmethod
     def _split_args(s):
         args, depth, cur = [], 0, ""
-        for ch in s:
+        for ch in re.findall(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[\s\S]''', s):
             if ch == "," and depth == 0:
                 args.append(cur.strip())
                 cur = ""
