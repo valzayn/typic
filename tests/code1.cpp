@@ -20,5 +20,7 @@ int main() {
         i = i + 1;
     }
 
+    cout << x++;
+
     return 0;
 }

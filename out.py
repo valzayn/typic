@@ -1,7 +1,3 @@
-# -*- coding: utf-8 -*-
-# Сгенерировано транслятором C++ -> Python
-
-# #include <iostream> -> встроенный print()
 def main():
     i = 0
     n = 0
